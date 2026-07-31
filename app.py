@@ -941,12 +941,1524 @@ class BalanceBeamGame(BaseGame):
 
 
 # ============================================================
+# AIR HOCKEY
+# ============================================================
+
+class AirHockeyGame(BaseGame):
+    """Air hockey vs an AI opponent. Your mallet slides along the bottom
+    edge, the AI's along the top edge -- thumb UP moves you right, DOWN
+    moves you left, every value in between mapped continuously (same
+    control scheme as Breakout's paddle). First to WIN_SCORE goals wins."""
+
+    name = "Air Hockey"
+    SUPPORTS_DIFFICULTY = True
+    SUPPORTS_TWO_PLAYER = False
+
+    RINK_MARGIN = 40
+    RINK_LEFT = RINK_MARGIN
+    RINK_RIGHT = WINDOW_W - RINK_MARGIN
+    RINK_TOP = RINK_MARGIN
+    RINK_BOTTOM = WINDOW_H - RINK_MARGIN
+
+    GOAL_HALF_WIDTH = 90  # goal mouth spans the center +/- this, in the top/bottom walls
+
+    MALLET_RADIUS = 26
+    PUCK_RADIUS = 10
+    PLAYER_Y = RINK_BOTTOM - 40
+    AI_Y = RINK_TOP + 40
+
+    PUCK_SPEED_INCREASE = 18   # puck speeds up slightly on every mallet hit
+    PUCK_SPEED_MAX = 560
+    WIN_SCORE = 5   # goals are hard-fought (small mallet, narrow goal) -- 7 made matches drag, especially on Hard
+
+    DIFFICULTY_SETTINGS = {
+        "Easy":   {"ai_speed": 220, "ai_slack": 60, "puck_speed": 260},
+        "Medium": {"ai_speed": 320, "ai_slack": 30, "puck_speed": 300},
+        "Hard":   {"ai_speed": 460, "ai_slack": 10, "puck_speed": 340},
+    }
+
+    def __init__(self, screen, controller, difficulty=None, mode="AI"):
+        super().__init__(screen, controller, difficulty, mode)
+        self.difficulty = difficulty or "Medium"
+
+        settings = self.DIFFICULTY_SETTINGS.get(self.difficulty, self.DIFFICULTY_SETTINGS["Medium"])
+        self.AI_SPEED = settings["ai_speed"]
+        self.AI_REACTION_SLACK = settings["ai_slack"]
+        self.PUCK_SPEED_START = settings["puck_speed"]
+
+        self.font_big = load_app_font("bold", 46)
+        self.font_med = load_app_font("bold", 26)
+        self.font_small = load_app_font("regular", 18)
+
+        self._build_ice_texture()
+        self.reset_match()
+
+    def _build_ice_texture(self):
+        """Pre-render the rink's icy surface once (gradient + shine streaks
+        + frost cracks) so draw() just blits it instead of recomputing it
+        every frame. Colors stay in the same blue/cyan family as ACCENT and
+        BLUE elsewhere in the app -- just brighter, like a lit rink in a
+        dark arena, so it fits the rest of the theme instead of looking
+        like a random bright rectangle dropped on top of it."""
+        w = int(self.RINK_RIGHT - self.RINK_LEFT)
+        h = int(self.RINK_BOTTOM - self.RINK_TOP)
+        ice_top = (150, 205, 230)
+        ice_bottom = (95, 165, 200)
+
+        surf = pygame.Surface((w, h))
+        for y in range(h):
+            t = y / max(1, h - 1)
+            color = tuple(int(ice_top[i] + (ice_bottom[i] - ice_top[i]) * t) for i in range(3))
+            pygame.draw.line(surf, color, (0, y), (w, y))
+
+        # soft diagonal shine streaks, like light glinting off the ice
+        shine = pygame.Surface((w, h), pygame.SRCALPHA)
+        for x in range(-h, w, 90):
+            pygame.draw.line(shine, (255, 255, 255, 22), (x, 0), (x + h, h), 34)
+        surf.blit(shine, (0, 0))
+
+        # a handful of faint frost cracks -- fixed seed so the pattern is
+        # stable across frames instead of flickering
+        rng = random.Random(2024)
+        for _ in range(7):
+            x, y = rng.randint(0, w), rng.randint(0, h)
+            points = [(x, y)]
+            for _ in range(rng.randint(2, 4)):
+                x = max(0, min(w, x + rng.randint(-45, 45)))
+                y = max(0, min(h, y + rng.randint(-45, 45)))
+                points.append((x, y))
+            pygame.draw.lines(surf, (180, 220, 240), False, points, 1)
+
+        self._ice_surface = surf
+
+    def reset_match(self):
+        self.player_score = 0
+        self.ai_score = 0
+        self.game_over = False
+        self.player_mallet_x = WINDOW_W / 2
+        self.ai_mallet_x = WINDOW_W / 2
+        self.reset_puck()
+
+    def reset_puck(self):
+        self.puck_x = WINDOW_W / 2
+        self.puck_y = WINDOW_H / 2
+        # bias the serve toward a decent vertical component so rallies
+        # reliably head toward a goal instead of drifting sideways forever
+        horiz_frac = random.uniform(-0.6, 0.6)
+        vert_frac = math.sqrt(max(0.01, 1.0 - horiz_frac ** 2)) * random.choice([-1, 1])
+        self.puck_vx = self.PUCK_SPEED_START * horiz_frac
+        self.puck_vy = self.PUCK_SPEED_START * vert_frac
+
+    def handle_event(self, event):
+        if self.game_over and event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+            self.reset_match()
+
+    def update(self, dt):
+        # thumb controls the mallet's horizontal position: thumb UP -> right,
+        # DOWN -> left, every value in between mapped continuously
+        value = max(0.0, min(1.0, self.controller.get_value()))
+        left_bound = self.RINK_LEFT + self.MALLET_RADIUS
+        right_bound = self.RINK_RIGHT - self.MALLET_RADIUS
+        self.player_mallet_x = left_bound + value * (right_bound - left_bound)
+
+        if self.game_over:
+            return
+
+        # ---- AI mallet: chases the puck's x (speed cap + dead zone) once the
+        # puck is in its own half where it's an actual threat; otherwise it
+        # drifts back to defend the center of its goal, same as a sensible
+        # human player naturally does. Without this it stays glued to the
+        # puck's x even while the puck is all the way down at the other end,
+        # leaving its own goal wide open the instant the puck comes back. ----
+        target_x = self.puck_x if self.puck_y < WINDOW_H / 2 else WINDOW_W / 2
+        diff = target_x - self.ai_mallet_x
+        if abs(diff) > self.AI_REACTION_SLACK:
+            move = self.AI_SPEED * dt
+            if diff > 0:
+                self.ai_mallet_x += min(move, diff)
+            else:
+                self.ai_mallet_x -= min(move, -diff)
+        self.ai_mallet_x = max(left_bound, min(right_bound, self.ai_mallet_x))
+
+        # ---- puck physics ----
+        self.puck_x += self.puck_vx * dt
+        self.puck_y += self.puck_vy * dt
+
+        # mallets are resolved BEFORE the wall/goal checks so the wall check
+        # always gets the final say for the frame. Doing it the other way
+        # around (walls first) let a mallet parked near a corner reflect the
+        # puck straight back into the wall it had just bounced off of --
+        # wall bounce and mallet bounce fighting each other forever with the
+        # puck stuck oscillating in the corner and never reaching the goal.
+        self._resolve_mallet_hit(self.player_mallet_x, self.PLAYER_Y)
+        self._resolve_mallet_hit(self.ai_mallet_x, self.AI_Y)
+
+        if self.puck_x - self.PUCK_RADIUS < self.RINK_LEFT:
+            self.puck_x = self.RINK_LEFT + self.PUCK_RADIUS
+            if self.puck_vx < 0:
+                self.puck_vx *= -1
+                self._jitter_puck_angle()
+        elif self.puck_x + self.PUCK_RADIUS > self.RINK_RIGHT:
+            self.puck_x = self.RINK_RIGHT - self.PUCK_RADIUS
+            if self.puck_vx > 0:
+                self.puck_vx *= -1
+                self._jitter_puck_angle()
+
+        in_goal_mouth = abs(self.puck_x - WINDOW_W / 2) < self.GOAL_HALF_WIDTH
+
+        if self.puck_y - self.PUCK_RADIUS < self.RINK_TOP:
+            if in_goal_mouth:
+                self._score(scorer="player")
+            else:
+                self.puck_y = self.RINK_TOP + self.PUCK_RADIUS
+                if self.puck_vy < 0:
+                    self.puck_vy *= -1
+                    self._jitter_puck_angle()
+        elif self.puck_y + self.PUCK_RADIUS > self.RINK_BOTTOM:
+            if in_goal_mouth:
+                self._score(scorer="ai")
+            else:
+                self.puck_y = self.RINK_BOTTOM - self.PUCK_RADIUS
+                if self.puck_vy > 0:
+                    self.puck_vy *= -1
+                    self._jitter_puck_angle()
+
+    def _score(self, scorer):
+        if scorer == "player":
+            self.player_score += 1
+        else:
+            self.ai_score += 1
+        if self.player_score >= self.WIN_SCORE or self.ai_score >= self.WIN_SCORE:
+            self.game_over = True
+        else:
+            self.reset_puck()
+
+    def _resolve_mallet_hit(self, mallet_x, mallet_y):
+        dx = self.puck_x - mallet_x
+        dy = self.puck_y - mallet_y
+        dist = math.hypot(dx, dy)
+        if dist >= self.MALLET_RADIUS + self.PUCK_RADIUS:
+            return
+        if dist < 1e-6:
+            dx, dy, dist = 0.0, -1.0, 1.0
+        nx, ny = dx / dist, dy / dist  # collision normal, mallet center -> puck center
+
+        # a mallet parked near a corner can otherwise bounce the puck
+        # straight into the adjacent wall, trapping it there indefinitely
+        # (wall bounce and mallet bounce fighting forever). Sign-flipping a
+        # unit component doesn't change the vector's length, so this stays
+        # a valid unit normal -- never let the bounce point into a wall
+        # anywhere near where the puck currently is. The threshold is
+        # MALLET_RADIUS-wide (not just "touching") because the puck can be
+        # hit anywhere within the mallet's reach, and the mallet itself can
+        # be parked with its edge nearly against the wall.
+        wall_buffer = self.MALLET_RADIUS
+        if self.puck_x - self.PUCK_RADIUS <= self.RINK_LEFT + wall_buffer and nx < 0:
+            nx = -nx
+        elif self.puck_x + self.PUCK_RADIUS >= self.RINK_RIGHT - wall_buffer and nx > 0:
+            nx = -nx
+        if self.puck_y - self.PUCK_RADIUS <= self.RINK_TOP + wall_buffer and ny < 0:
+            ny = -ny
+        elif self.puck_y + self.PUCK_RADIUS >= self.RINK_BOTTOM - wall_buffer and ny > 0:
+            ny = -ny
+
+        speed = min(self.PUCK_SPEED_MAX, math.hypot(self.puck_vx, self.puck_vy) + self.PUCK_SPEED_INCREASE)
+        self.puck_vx = nx * speed
+        self.puck_vy = ny * speed
+
+        # push the puck fully outside the mallet so it can't keep re-colliding next frame
+        overlap = (self.MALLET_RADIUS + self.PUCK_RADIUS) - dist
+        self.puck_x += nx * overlap
+        self.puck_y += ny * overlap
+        self._jitter_puck_angle()
+
+    def _jitter_puck_angle(self, max_degrees=3.0):
+        """Nudge the puck's direction by a small random angle on every
+        bounce. Since mallets only move horizontally, a puck that happens
+        to collide dead-center (same x as the mallet) reflects perfectly
+        vertically -- and can stay perfectly vertical forever, endlessly
+        bouncing between the walls/mallets outside the goal mouth without
+        ever scoring. A tiny bit of noise breaks that exact alignment."""
+        speed = math.hypot(self.puck_vx, self.puck_vy)
+        angle = math.atan2(self.puck_vy, self.puck_vx) + math.radians(random.uniform(-max_degrees, max_degrees))
+        self.puck_vx = math.cos(angle) * speed
+        self.puck_vy = math.sin(angle) * speed
+
+    def draw(self):
+        self.screen.blit(BACKGROUND, (0, 0))
+        self.screen.blit(self._ice_surface, (self.RINK_LEFT, self.RINK_TOP))
+
+        rink_rect = pygame.Rect(self.RINK_LEFT, self.RINK_TOP,
+                                 self.RINK_RIGHT - self.RINK_LEFT, self.RINK_BOTTOM - self.RINK_TOP)
+        pygame.draw.rect(self.screen, DARK_GRAY, rink_rect, width=3, border_radius=6)
+
+        # center line + circle
+        pygame.draw.line(self.screen, DARK_GRAY, (self.RINK_LEFT, WINDOW_H // 2), (self.RINK_RIGHT, WINDOW_H // 2), 2)
+        pygame.draw.circle(self.screen, DARK_GRAY, (WINDOW_W // 2, WINDOW_H // 2), 55, 2)
+
+        # goal mouths, highlighted
+        goal_left = WINDOW_W // 2 - self.GOAL_HALF_WIDTH
+        goal_right = WINDOW_W // 2 + self.GOAL_HALF_WIDTH
+        pygame.draw.line(self.screen, RED, (goal_left, self.RINK_TOP), (goal_right, self.RINK_TOP), 4)
+        pygame.draw.line(self.screen, BLUE, (goal_left, self.RINK_BOTTOM), (goal_right, self.RINK_BOTTOM), 4)
+
+        pygame.draw.circle(self.screen, RED, (int(self.ai_mallet_x), int(self.AI_Y)), self.MALLET_RADIUS)
+        pygame.draw.circle(self.screen, WHITE, (int(self.ai_mallet_x), int(self.AI_Y)), self.MALLET_RADIUS, 2)
+        pygame.draw.circle(self.screen, BLUE, (int(self.player_mallet_x), int(self.PLAYER_Y)), self.MALLET_RADIUS)
+        pygame.draw.circle(self.screen, WHITE, (int(self.player_mallet_x), int(self.PLAYER_Y)), self.MALLET_RADIUS, 2)
+
+        pygame.draw.circle(self.screen, WHITE, (int(self.puck_x), int(self.puck_y)), self.PUCK_RADIUS)
+        pygame.draw.circle(self.screen, DARK_GRAY, (int(self.puck_x), int(self.puck_y)), self.PUCK_RADIUS, 2)
+
+        score_text = self.font_med.render(f"{self.player_score}   {self.ai_score}", True, WHITE)
+        self.screen.blit(score_text, (WINDOW_W // 2 - score_text.get_width() // 2, 8))
+
+        label_ai = self.font_small.render("AI", True, RED)
+        self.screen.blit(label_ai, (WINDOW_W // 2 - 100, self.RINK_TOP + 6))
+        label_you = self.font_small.render("YOU", True, BLUE)
+        self.screen.blit(label_you, (WINDOW_W // 2 - 100, self.RINK_BOTTOM - 26))
+
+        if not self.controller.get_hand_detected():
+            warn = self.font_small.render("No hand detected -- show your thumb to the webcam", True, RED)
+            self.screen.blit(warn, (WINDOW_W // 2 - warn.get_width() // 2, WINDOW_H // 2 - 90))
+
+        hint = self.font_small.render(
+            f"Thumb UP = mallet right, DOWN = mallet left | Difficulty: {self.difficulty} | ESC = menu",
+            True, GRAY)
+        self.screen.blit(hint, (WINDOW_W // 2 - hint.get_width() // 2, WINDOW_H - 20))
+
+        if self.game_over:
+            winner = "YOU WIN!" if self.player_score > self.ai_score else "AI WINS!"
+            color = GREEN if self.player_score > self.ai_score else RED
+            win_text = self.font_big.render(winner, True, color)
+            self.screen.blit(win_text, (WINDOW_W // 2 - win_text.get_width() // 2, WINDOW_H // 2 - 60))
+
+            retry_text = self.font_med.render("Press R to play again, ESC for menu", True, WHITE)
+            self.screen.blit(retry_text, (WINDOW_W // 2 - retry_text.get_width() // 2, WINDOW_H // 2 + 10))
+
+
+# ============================================================
+# THUMB GOLF
+# ============================================================
+
+class ThumbGolfGame(BaseGame):
+    """One-hole-at-a-time golf, played across a 3-hole round.
+
+    Two-hand control: RIGHT thumb sets shot power live (1.0 = full power,
+    every value in between scales proportionally), LEFT thumb fires the
+    shot -- raise it into a thumbs-up and the ball launches using whatever
+    power the right thumb reads at that instant. The shot always aims
+    toward the hole, so overshooting just means the next shot needs less
+    power, no separate aiming control needed.
+
+    Modes: 1 Player (solo), 2 Player (take turns on the same hole before
+    moving to the next), or vs AI (an intentionally weak AI opponent).
+    Each difficulty has its own set of 3 themed holes (meadow/desert/snow)
+    with a different hazard each -- a sand trap, a water hazard, and a
+    crosswind -- and each difficulty's holes start further from the tee.
+    """
+
+    name = "Thumb Golf"
+    SUPPORTS_DIFFICULTY = False  # handled internally: needs a 3-way mode
+    SUPPORTS_TWO_PLAYER = False  # choice, not the generic 1P-vs-AI/2P split
+
+    COURSE_MARGIN = 40
+    COURSE_LEFT = COURSE_MARGIN
+    COURSE_RIGHT = WINDOW_W - COURSE_MARGIN
+    COURSE_TOP = 90
+    COURSE_BOTTOM = WINDOW_H - COURSE_MARGIN
+    GROUND_Y = 470
+
+    TEE_X = COURSE_LEFT + 40
+    BALL_RADIUS = 9
+    HOLE_RADIUS = 16
+
+    LAUNCH_ANGLE = math.radians(38)
+    GRAVITY = 900.0
+    MIN_SHOT_SPEED = 80.0
+    MAX_SHOT_SPEED = 640.0
+    LANDING_DAMPING = 0.82   # fraction of horizontal speed kept after the bounce-down on landing
+    ROLL_FRICTION = 380.0    # px/sec^2 deceleration while rolling on the fairway
+    SAND_ROLL_FRICTION = 1400.0  # much stronger -- a ball landing in sand stops fast
+    ROLL_STOP_SPEED = 4.0
+
+    SHOOT_THRESHOLD = 0.75      # LEFT thumb value above this counts as "thumbs up" (fire)
+    CAPTURE_MAX_SPEED = 240.0   # a ball rolling faster than this skips over the cup instead of dropping in
+
+    DISTANCE_UNIT_SCALE = 1.0 / 3.0  # purely cosmetic: display px as golf-y "yards"
+
+    HOLES_PER_ROUND = 3
+    MAX_STROKES_PER_HOLE = 8   # mercy rule so a bad run (or a deliberately bad AI) can't drag on forever
+    TURN_TRANSITION_TIME = 1.8  # seconds the "holed in X!" message shows before the next turn/hole
+
+    AI_THINK_TIME = 1.0       # seconds of "lining up" pause before the AI swings
+    AI_POWER_NOISE = 0.22     # how wildly the "bad" AI misjudges its power -- this IS the bad AI
+    AI_DISTANCE_REFERENCE = 665.0  # ~= max distance a full-power shot travels, for the AI's rough estimate
+
+    # tuned so a well-calibrated (not maxed-out) swing reaches each hole:
+    # roughly 62% power for Easy, 80% for Medium, 96% for Hard
+    DIFFICULTY_SETTINGS = {
+        "Easy":   {"hole_distance": 260, "par": 2},
+        "Medium": {"hole_distance": 430, "par": 3},
+        "Hard":   {"hole_distance": 610, "par": 4},
+    }
+
+    # one entry per hole in the round -- theme + hazard, shared across all
+    # three difficulties (only hole_distance/par scale with difficulty)
+    HOLE_DEFS = [
+        {"theme": "meadow", "obstacle": "sand", "obstacle_frac": 0.55, "obstacle_width_frac": 0.14},
+        {"theme": "desert", "obstacle": "water", "obstacle_frac": 0.60, "obstacle_width_frac": 0.11},
+        {"theme": "snow", "obstacle": "wind", "wind_accel": 70.0},
+    ]
+
+    THEME_COLORS = {
+        "meadow": {
+            "sky_top": (150, 205, 240), "sky_bottom": (205, 228, 246),
+            "ground_top": (80, 190, 120), "ground_bottom": (45, 140, 85),
+            "horizon": (60, 170, 100),
+        },
+        "desert": {
+            "sky_top": (245, 210, 165), "sky_bottom": (255, 235, 205),
+            "ground_top": (225, 195, 140), "ground_bottom": (185, 150, 95),
+            "horizon": (195, 160, 100),
+        },
+        "snow": {
+            "sky_top": (205, 222, 238), "sky_bottom": (232, 238, 246),
+            "ground_top": (235, 240, 248), "ground_bottom": (205, 218, 232),
+            "horizon": (190, 205, 222),
+        },
+    }
+
+    def __init__(self, screen, controller, difficulty=None, mode="AI"):
+        super().__init__(screen, controller, difficulty, mode)
+
+        self.font_big = load_app_font("bold", 40)
+        self.font_med = load_app_font("bold", 26)
+        self.font_small = load_app_font("regular", 18)
+        self.font_tiny = load_app_font("regular", 15)
+        self._thumbsup_icon = render_icon("\U0001F44D", "UP", 22, self.font_tiny, WHITE)  # 👍, cached once
+
+        self._course_textures = {theme: self._build_course_texture(theme) for theme in self.THEME_COLORS}
+
+        self.match_mode = "1P"
+        self.difficulty = "Medium"
+        self.phase = "MODE_SELECT"
+        self._build_mode_buttons()
+
+    # ---------------------------------------------------------------
+    # course art
+    # ---------------------------------------------------------------
+
+    def _build_course_texture(self, theme):
+        """Pre-render one theme's sky+fairway once (cached, blitted each
+        frame) instead of recomputing it every frame."""
+        colors = self.THEME_COLORS[theme]
+        w = int(self.COURSE_RIGHT - self.COURSE_LEFT)
+        h = int(self.COURSE_BOTTOM - self.COURSE_TOP)
+        sky_h = int(self.GROUND_Y - self.COURSE_TOP)
+        grass_h = h - sky_h
+
+        surf = pygame.Surface((w, h))
+        for y in range(sky_h):
+            t = y / max(1, sky_h - 1)
+            color = tuple(int(colors["sky_top"][i] + (colors["sky_bottom"][i] - colors["sky_top"][i]) * t)
+                          for i in range(3))
+            pygame.draw.line(surf, color, (0, y), (w, y))
+        for y in range(grass_h):
+            t = y / max(1, grass_h - 1)
+            color = tuple(int(colors["ground_top"][i] + (colors["ground_bottom"][i] - colors["ground_top"][i]) * t)
+                          for i in range(3))
+            pygame.draw.line(surf, color, (0, sky_h + y), (w, sky_h + y))
+        pygame.draw.line(surf, colors["horizon"], (0, sky_h), (w, sky_h), 3)
+
+        rng = random.Random(hash(theme) & 0xFFFF)  # stable per-theme seed, no per-frame flicker
+        if theme == "meadow":
+            clouds = pygame.Surface((w, h), pygame.SRCALPHA)
+            for _ in range(5):
+                cx, cy = rng.randint(30, w - 30), rng.randint(20, max(21, sky_h // 2))
+                for dx, dy, r in ((0, 0, 18), (16, 4, 14), (-14, 3, 13), (6, -8, 11)):
+                    pygame.draw.circle(clouds, (255, 255, 255, 90), (cx + dx, cy + dy), r)
+            surf.blit(clouds, (0, 0))
+        elif theme == "desert":
+            cactus_color = (70, 140, 80)
+            for _ in range(4):
+                cx = rng.randint(20, w - 20)
+                cy = sky_h + rng.randint(6, max(7, grass_h // 3))
+                pygame.draw.rect(surf, cactus_color, (cx - 4, cy - 26, 8, 30), border_radius=4)
+                pygame.draw.rect(surf, cactus_color, (cx - 14, cy - 14, 8, 16), border_radius=4)
+                pygame.draw.rect(surf, cactus_color, (cx + 6, cy - 18, 8, 20), border_radius=4)
+        elif theme == "snow":
+            tree_color = (40, 95, 65)
+            for _ in range(4):
+                tx = rng.randint(20, w - 20)
+                ty = sky_h + rng.randint(4, max(5, grass_h // 3))
+                pygame.draw.polygon(surf, tree_color, [(tx, ty - 34), (tx - 16, ty - 6), (tx + 16, ty - 6)])
+                pygame.draw.polygon(surf, tree_color, [(tx, ty - 24), (tx - 13, ty + 2), (tx + 13, ty + 2)])
+                pygame.draw.rect(surf, (90, 60, 40), (tx - 3, ty, 6, 8))
+
+        return surf
+
+    # ---------------------------------------------------------------
+    # mode / difficulty select (self-contained -- no shared ModeSelect/
+    # DifficultySelect screens, since Golf needs a 3-way mode choice and
+    # BOTH 2P and vs-AI also need a difficulty/hole-set choice, unlike
+    # Pong's simpler AI-only-picks-difficulty flow)
+    # ---------------------------------------------------------------
+
+    def _build_mode_buttons(self):
+        btn_w, btn_h, gap = 320, 64, 20
+        total_h = 3 * btn_h + 2 * gap
+        start_y = WINDOW_H // 2 - total_h // 2 + 20
+        specs = [
+            ("1P", "1 Player", "\U0001F464", "1"),
+            ("2P", "2 Player", "\U0001F465", "2"),
+            ("AI", "vs AI", "\U0001F916", "A"),
+        ]
+        self.mode_buttons = []
+        for i, (mode_id, label, icon, fallback) in enumerate(specs):
+            rect = pygame.Rect(WINDOW_W // 2 - btn_w // 2, start_y + i * (btn_h + gap), btn_w, btn_h)
+            btn = Button(rect, label, self.font_med, icon_emoji=icon, icon_fallback=fallback,
+                         base_color=GREEN, text_color=BLACK)
+            self.mode_buttons.append((btn, mode_id))
+
+    def _build_difficulty_buttons(self):
+        btn_w, btn_h, gap = 320, 64, 20
+        total_h = 3 * btn_h + 2 * gap
+        start_y = WINDOW_H // 2 - total_h // 2 + 20
+        specs = [("Easy", GREEN), ("Medium", YELLOW), ("Hard", RED)]
+        self.difficulty_buttons = []
+        for i, (label, color) in enumerate(specs):
+            rect = pygame.Rect(WINDOW_W // 2 - btn_w // 2, start_y + i * (btn_h + gap), btn_w, btn_h)
+            btn = Button(rect, label, self.font_med, base_color=color, text_color=BLACK)
+            self.difficulty_buttons.append((btn, label))
+        self.back_button = Button(pygame.Rect(30, 30, 110, 46), "Back", self.font_small,
+                                   icon_fallback="←", base_color=DARK_GRAY, text_color=WHITE)
+
+    def _draw_mode_select(self):
+        self.screen.blit(BACKGROUND, (0, 0))
+        title = self.font_big.render("Thumb Golf", True, WHITE)
+        self.screen.blit(title, (WINDOW_W // 2 - title.get_width() // 2, 90))
+        subtitle = self.font_small.render("Choose how you want to play", True, GRAY)
+        self.screen.blit(subtitle, (WINDOW_W // 2 - subtitle.get_width() // 2, 150))
+        for btn, _ in self.mode_buttons:
+            btn.draw(self.screen)
+
+    def _draw_difficulty_select(self):
+        self.screen.blit(BACKGROUND, (0, 0))
+        title = self.font_big.render("Choose Difficulty", True, WHITE)
+        self.screen.blit(title, (WINDOW_W // 2 - title.get_width() // 2, 90))
+        subtitle = self.font_small.render(
+            "3 holes each -- harder difficulties start further from the tee", True, GRAY)
+        self.screen.blit(subtitle, (WINDOW_W // 2 - subtitle.get_width() // 2, 150))
+        for btn, _ in self.difficulty_buttons:
+            btn.draw(self.screen)
+        self.back_button.draw(self.screen)
+
+    # ---------------------------------------------------------------
+    # match / turn / hole setup
+    # ---------------------------------------------------------------
+
+    def start_round(self):
+        if self.match_mode == "1P":
+            self.players = ["YOU"]
+        elif self.match_mode == "2P":
+            self.players = ["P1", "P2"]
+        else:  # "AI"
+            self.players = ["YOU", "AI"]
+        self.scores = {p: [] for p in self.players}
+        self.hole_idx = 0
+        self.turn_idx = 0
+        self._setup_hole()
+        self.phase = "PLAYING"
+
+    def _setup_hole(self):
+        hole_def = self.HOLE_DEFS[self.hole_idx]
+        settings = self.DIFFICULTY_SETTINGS[self.difficulty]
+        self.par = settings["par"]
+        hole_distance = settings["hole_distance"]
+        self.hole_x = self.TEE_X + hole_distance
+
+        self.theme = hole_def["theme"]
+        self.obstacle_type = hole_def.get("obstacle")
+        self.wind_accel = 0.0
+        self.obstacle_left = self.obstacle_right = None
+        if self.obstacle_type in ("sand", "water"):
+            center = self.TEE_X + hole_distance * hole_def["obstacle_frac"]
+            half_w = hole_distance * hole_def["obstacle_width_frac"] / 2
+            self.obstacle_left = center - half_w
+            self.obstacle_right = center + half_w
+        elif self.obstacle_type == "wind":
+            self.wind_accel = hole_def["wind_accel"]
+
+        self._course_surface = self._course_textures[self.theme]
+        self.turn_idx = 0
+        self._start_player_turn()
+
+    def _start_player_turn(self):
+        self.ball_x = float(self.TEE_X)
+        self.ball_y = float(self.GROUND_Y)
+        self.ball_vx = 0.0
+        self.ball_vy = 0.0
+        self.ball_state = "ready"
+        self.strokes = 0
+        self.holed = False
+        self.last_shot_power = None
+        self.power_live = 0.0
+        self._prev_left_value = None
+        self.ai_timer = None
+
+    def _current_player(self):
+        return self.players[self.turn_idx]
+
+    def _current_player_is_ai(self):
+        return self._current_player() == "AI"
+
+    def handle_event(self, event):
+        if self.phase == "MODE_SELECT":
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                for btn, mode_id in self.mode_buttons:
+                    if btn.is_clicked(event.pos):
+                        self.match_mode = mode_id
+                        self._build_difficulty_buttons()
+                        self.phase = "DIFFICULTY_SELECT"
+                        return
+        elif self.phase == "DIFFICULTY_SELECT":
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                for btn, label in self.difficulty_buttons:
+                    if btn.is_clicked(event.pos):
+                        self.difficulty = label
+                        self.start_round()
+                        return
+                if self.back_button.is_clicked(event.pos):
+                    self._build_mode_buttons()
+                    self.phase = "MODE_SELECT"
+                    return
+        else:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                self._build_mode_buttons()
+                self.phase = "MODE_SELECT"
+
+    # ---------------------------------------------------------------
+    # update
+    # ---------------------------------------------------------------
+
+    def update(self, dt):
+        if self.phase in ("MODE_SELECT", "DIFFICULTY_SELECT"):
+            mouse_pos = pygame.mouse.get_pos()
+            mouse_down = pygame.mouse.get_pressed()[0]
+            buttons = self.mode_buttons if self.phase == "MODE_SELECT" else self.difficulty_buttons
+            for btn, _ in buttons:
+                btn.update(dt, mouse_pos, mouse_down)
+            if self.phase == "DIFFICULTY_SELECT":
+                self.back_button.update(dt, mouse_pos, mouse_down)
+        elif self.phase == "PLAYING":
+            self._update_playing(dt)
+        elif self.phase == "TURN_COMPLETE":
+            self.turn_transition_timer -= dt
+            if self.turn_transition_timer <= 0:
+                self._advance_after_turn()
+        # ROUND_COMPLETE: nothing to update, just waiting for R
+
+    def _update_playing(self, dt):
+        if self.ball_state == "ready" and not self.holed:
+            if self._current_player_is_ai():
+                if self.ai_timer is None:
+                    self.ai_timer = self.AI_THINK_TIME
+                else:
+                    self.ai_timer -= dt
+                    if self.ai_timer <= 0:
+                        self._take_ai_shot()
+                        self.ai_timer = None
+            else:
+                right_value = max(0.0, min(1.0, self.controller.get_right_value()))
+                left_value = max(0.0, min(1.0, self.controller.get_left_value()))
+                self.power_live = right_value
+
+                if self._prev_left_value is None:
+                    self._prev_left_value = left_value
+                else:
+                    if self._prev_left_value <= self.SHOOT_THRESHOLD < left_value:
+                        self._take_shot(right_value)
+                    self._prev_left_value = left_value
+        elif self.ball_state != "ready":
+            self._update_flight(dt)
+            near_ground = abs(self.ball_y - self.GROUND_Y) < 4
+            slow_enough = abs(self.ball_vx) < self.CAPTURE_MAX_SPEED
+            if near_ground and slow_enough and abs(self.ball_x - self.hole_x) < self.HOLE_RADIUS:
+                self.holed = True
+                self.ball_state = "ready"
+                self.ball_x = self.hole_x
+                self.ball_y = self.GROUND_Y
+
+        if self.ball_state == "ready" and (self.holed or self.strokes >= self.MAX_STROKES_PER_HOLE):
+            self._end_turn()
+
+    def _take_shot(self, power):
+        self.last_shot_power = power
+        speed = self.MIN_SHOT_SPEED + power * (self.MAX_SHOT_SPEED - self.MIN_SHOT_SPEED)
+        direction = 1.0 if self.hole_x >= self.ball_x else -1.0
+        self.ball_vx = direction * speed * math.cos(self.LAUNCH_ANGLE)
+        self.ball_vy = -speed * math.sin(self.LAUNCH_ANGLE)
+        self.ball_state = "flying"
+        self.strokes += 1
+
+    def _take_ai_shot(self):
+        # deliberately bad: a rough distance-based estimate plus a lot of noise
+        remaining = abs(self.hole_x - self.ball_x)
+        target_power = max(0.0, min(1.0, math.sqrt(remaining / self.AI_DISTANCE_REFERENCE)))
+        noisy_power = target_power + random.uniform(-self.AI_POWER_NOISE, self.AI_POWER_NOISE)
+        noisy_power = max(0.05, min(1.0, noisy_power))
+        self._take_shot(noisy_power)
+
+    def _update_flight(self, dt):
+        if self.ball_state == "flying":
+            self.ball_vy += self.GRAVITY * dt
+            if self.wind_accel:
+                self.ball_vx += self.wind_accel * dt
+            self.ball_x += self.ball_vx * dt
+            self.ball_y += self.ball_vy * dt
+            if self.ball_y >= self.GROUND_Y:
+                self.ball_y = self.GROUND_Y
+                self.ball_vx *= self.LANDING_DAMPING
+                self.ball_vy = 0.0
+                self.ball_state = "rolling"
+                self._check_water_landing()
+        elif self.ball_state == "rolling":
+            friction = self.ROLL_FRICTION
+            if (self.obstacle_type == "sand" and self.obstacle_left is not None
+                    and self.obstacle_left <= self.ball_x <= self.obstacle_right):
+                friction = self.SAND_ROLL_FRICTION
+            self.ball_x += self.ball_vx * dt
+            if self.ball_vx > 0:
+                self.ball_vx = max(0.0, self.ball_vx - friction * dt)
+            else:
+                self.ball_vx = min(0.0, self.ball_vx + friction * dt)
+            if abs(self.ball_vx) < self.ROLL_STOP_SPEED:
+                self.ball_vx = 0.0
+                self.ball_state = "ready"
+            self._check_water_landing()
+
+        self.ball_x = max(self.COURSE_LEFT + self.BALL_RADIUS,
+                           min(self.COURSE_RIGHT - self.BALL_RADIUS, self.ball_x))
+
+    def _check_water_landing(self):
+        if (self.obstacle_type != "water" or self.obstacle_left is None
+                or not (self.obstacle_left <= self.ball_x <= self.obstacle_right)):
+            return
+        # splash -- one-stroke penalty, dropped just short of the hazard
+        self.strokes += 1
+        drop_x = self.obstacle_left - 20 if self.ball_vx >= 0 else self.obstacle_right + 20
+        self.ball_x = max(self.COURSE_LEFT + self.BALL_RADIUS,
+                           min(self.COURSE_RIGHT - self.BALL_RADIUS, drop_x))
+        self.ball_y = self.GROUND_Y
+        self.ball_vx = 0.0
+        self.ball_vy = 0.0
+        self.ball_state = "ready"
+
+    def _end_turn(self):
+        player = self._current_player()
+        self.scores[player].append(self.strokes)
+        self.turn_result_holed = self.holed
+        self.turn_result_strokes = self.strokes
+        self.turn_result_player = player
+        self.phase = "TURN_COMPLETE"
+        self.turn_transition_timer = self.TURN_TRANSITION_TIME
+
+    def _advance_after_turn(self):
+        self.turn_idx += 1
+        if self.turn_idx >= len(self.players):
+            self.turn_idx = 0
+            self.hole_idx += 1
+            if self.hole_idx >= self.HOLES_PER_ROUND:
+                self.phase = "ROUND_COMPLETE"
+                return
+            self._setup_hole()
+        else:
+            self._start_player_turn()
+        self.phase = "PLAYING"
+
+    # ---------------------------------------------------------------
+    # draw
+    # ---------------------------------------------------------------
+
+    def draw(self):
+        if self.phase == "MODE_SELECT":
+            self._draw_mode_select()
+        elif self.phase == "DIFFICULTY_SELECT":
+            self._draw_difficulty_select()
+        elif self.phase in ("PLAYING", "TURN_COMPLETE"):
+            self._draw_playing()
+            if self.phase == "TURN_COMPLETE":
+                self._draw_turn_complete_overlay()
+        elif self.phase == "ROUND_COMPLETE":
+            self._draw_playing()
+            self._draw_round_complete_overlay()
+
+    def _draw_playing(self):
+        self.screen.blit(BACKGROUND, (0, 0))
+        self.screen.blit(self._course_surface, (self.COURSE_LEFT, self.COURSE_TOP))
+        self._draw_obstacle()
+
+        pygame.draw.circle(self.screen, WHITE, (int(self.TEE_X), int(self.GROUND_Y)), 4)
+
+        flag_top = self.GROUND_Y - 55
+        pygame.draw.ellipse(self.screen, (25, 25, 30), (self.hole_x - 10, self.GROUND_Y - 4, 20, 8))
+        pygame.draw.line(self.screen, GRAY, (self.hole_x, self.GROUND_Y), (self.hole_x, flag_top), 3)
+        pygame.draw.polygon(self.screen, RED, [(self.hole_x, flag_top),
+                                                (self.hole_x + 22, flag_top + 9),
+                                                (self.hole_x, flag_top + 18)])
+
+        pygame.draw.circle(self.screen, WHITE, (int(self.ball_x), int(self.ball_y)), self.BALL_RADIUS)
+        pygame.draw.circle(self.screen, DARK_GRAY, (int(self.ball_x), int(self.ball_y)), self.BALL_RADIUS, 2)
+
+        if self._current_player_is_ai():
+            self._draw_ai_turn_indicator()
+        else:
+            self._draw_power_meter()
+            self._draw_shoot_indicator()
+
+        self._draw_scoreboard()
+        self._draw_hud()
+
+    def _draw_obstacle(self):
+        if self.obstacle_left is None:
+            return
+        rect = (self.obstacle_left, self.GROUND_Y - 6, self.obstacle_right - self.obstacle_left, 16)
+        if self.obstacle_type == "sand":
+            pygame.draw.ellipse(self.screen, (210, 185, 130), rect)
+            pygame.draw.ellipse(self.screen, (180, 155, 100), rect, 2)
+        elif self.obstacle_type == "water":
+            pygame.draw.ellipse(self.screen, (80, 160, 200), rect)
+            pygame.draw.ellipse(self.screen, (50, 120, 160), rect, 2)
+
+    def _draw_power_meter(self):
+        x, y, w, h = 24, 110, 26, 220
+        pygame.draw.rect(self.screen, DARK_GRAY, (x, y, w, h), border_radius=8)
+
+        fill_h = int(h * self.power_live)
+        if fill_h > 0:
+            fill_color = GREEN if self.power_live < 0.55 else (YELLOW if self.power_live < 0.82 else RED)
+            pygame.draw.rect(self.screen, fill_color, (x, y + h - fill_h, w, fill_h), border_radius=8)
+        pygame.draw.rect(self.screen, GRAY, (x, y, w, h), width=2, border_radius=8)
+
+        if self.last_shot_power is not None:
+            marker_y = y + h - int(h * self.last_shot_power)
+            pygame.draw.line(self.screen, WHITE, (x - 5, marker_y), (x + w + 5, marker_y), 2)
+
+        label = self.font_tiny.render("POWER", True, GRAY)
+        self.screen.blit(label, (x + w // 2 - label.get_width() // 2, y - 20))
+        hand_label = self.font_tiny.render("RIGHT", True, GRAY)
+        self.screen.blit(hand_label, (x + w // 2 - hand_label.get_width() // 2, y + h + 6))
+
+    def _draw_shoot_indicator(self):
+        x, y, r = 37, 372, 20
+        ready = self._prev_left_value is not None and self._prev_left_value > self.SHOOT_THRESHOLD
+        color = GREEN if ready else DARK_GRAY
+        pygame.draw.circle(self.screen, color, (x, y), r)
+        pygame.draw.circle(self.screen, GRAY, (x, y), r, 2)
+
+        icon = self._thumbsup_icon
+        self.screen.blit(icon, (x - icon.get_width() // 2, y - icon.get_height() // 2))
+
+        label = self.font_tiny.render("SHOOT", True, GRAY)
+        self.screen.blit(label, (x - label.get_width() // 2, y + r + 6))
+        hand_label = self.font_tiny.render("LEFT", True, GRAY)
+        self.screen.blit(hand_label, (x - hand_label.get_width() // 2, y + r + 24))
+
+    def _draw_ai_turn_indicator(self):
+        label = self.font_small.render(f"{self._current_player()} is lining up...", True, GRAY)
+        self.screen.blit(label, (24, 112))
+        if self.ai_timer is not None:
+            frac = max(0.0, min(1.0, self.ai_timer / self.AI_THINK_TIME))
+            bar_w = 160
+            pygame.draw.rect(self.screen, DARK_GRAY, (24, 144, bar_w, 10), border_radius=5)
+            pygame.draw.rect(self.screen, YELLOW, (24, 144, int(bar_w * (1 - frac)), 10), border_radius=5)
+
+    def _draw_scoreboard(self):
+        hole_text = self.font_small.render(f"HOLE {self.hole_idx + 1} / {self.HOLES_PER_ROUND}", True, GRAY)
+        self.screen.blit(hole_text, (WINDOW_W // 2 - hole_text.get_width() // 2, 8))
+
+        def total_for(p):
+            return sum(self.scores[p]) + (self.strokes if p == self._current_player() else 0)
+
+        if len(self.players) == 1:
+            p = self.players[0]
+            score_text = self.font_big.render(f"Strokes: {self.strokes}   Total: {total_for(p)}", True, WHITE)
+            self.screen.blit(score_text, (WINDOW_W // 2 - score_text.get_width() // 2, 30))
+        else:
+            p1, p2 = self.players
+            color1 = WHITE if self._current_player() == p1 else GRAY
+            color2 = WHITE if self._current_player() == p2 else GRAY
+            p1_text = self.font_med.render(f"{p1}: {total_for(p1)}", True, color1)
+            p2_text = self.font_med.render(f"{p2}: {total_for(p2)}", True, color2)
+            gap = 40
+            total_w = p1_text.get_width() + p2_text.get_width() + gap
+            start_x = WINDOW_W // 2 - total_w // 2
+            self.screen.blit(p1_text, (start_x, 30))
+            self.screen.blit(p2_text, (start_x + p1_text.get_width() + gap, 30))
+
+    def _draw_hud(self):
+        yards_left = abs(self.hole_x - self.ball_x) * self.DISTANCE_UNIT_SCALE
+        info_text = self.font_small.render(
+            f"{self.difficulty}  -  Par {self.par}  -  {yards_left:0.0f} yd to hole", True, GRAY)
+        self.screen.blit(info_text, (WINDOW_W - info_text.get_width() - 20, 20))
+
+        if self.obstacle_type == "wind" and self.wind_accel:
+            arrow = "→" if self.wind_accel > 0 else "←"
+            wind_text = self.font_small.render(f"WIND {arrow}", True, ACCENT)
+            self.screen.blit(wind_text, (WINDOW_W - wind_text.get_width() - 20, 46))
+
+        warn_y = WINDOW_H // 2 - 40
+        if not self._current_player_is_ai():
+            if not self.controller.get_right_detected():
+                warn = self.font_small.render("RIGHT hand not detected -- needed for power", True, RED)
+                self.screen.blit(warn, (WINDOW_W // 2 - warn.get_width() // 2, warn_y))
+                warn_y += 26
+            if not self.controller.get_left_detected():
+                warn = self.font_small.render("LEFT hand not detected -- needed to shoot", True, RED)
+                self.screen.blit(warn, (WINDOW_W // 2 - warn.get_width() // 2, warn_y))
+
+        if self._current_player_is_ai():
+            hint_str = f"{self._current_player()} is taking their shot... | R = restart match | ESC = menu"
+        else:
+            hint_str = (f"{self._current_player()}'s turn  -  RIGHT thumb = power | LEFT thumb UP = shoot "
+                        "| R = restart match | ESC = menu")
+        hint = self.font_small.render(hint_str, True, GRAY)
+        self.screen.blit(hint, (WINDOW_W // 2 - hint.get_width() // 2, WINDOW_H - 20))
+
+    def _draw_turn_complete_overlay(self):
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        self.screen.blit(overlay, (0, 0))
+
+        if self.turn_result_holed:
+            text, color = f"{self.turn_result_player} holed in {self.turn_result_strokes}!", GREEN
+        else:
+            text, color = f"{self.turn_result_player} picks up after {self.turn_result_strokes} strokes", YELLOW
+        msg = self.font_big.render(text, True, color)
+        self.screen.blit(msg, (WINDOW_W // 2 - msg.get_width() // 2, WINDOW_H // 2 - 20))
+
+    def _draw_round_complete_overlay(self):
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        self.screen.blit(overlay, (0, 0))
+
+        title = self.font_big.render("ROUND COMPLETE!", True, GREEN)
+        self.screen.blit(title, (WINDOW_W // 2 - title.get_width() // 2, WINDOW_H // 2 - 100))
+
+        totals = {p: sum(self.scores[p]) for p in self.players}
+        if len(self.players) == 1:
+            p = self.players[0]
+            line = self.font_med.render(f"Total strokes: {totals[p]}", True, WHITE)
+            self.screen.blit(line, (WINDOW_W // 2 - line.get_width() // 2, WINDOW_H // 2 - 30))
+        else:
+            p1, p2 = self.players
+            line = self.font_med.render(f"{p1}: {totals[p1]}   {p2}: {totals[p2]}", True, WHITE)
+            self.screen.blit(line, (WINDOW_W // 2 - line.get_width() // 2, WINDOW_H // 2 - 30))
+            if totals[p1] < totals[p2]:
+                winner = f"{p1} wins!"
+            elif totals[p2] < totals[p1]:
+                winner = f"{p2} wins!"
+            else:
+                winner = "It's a tie!"
+            wtext = self.font_med.render(winner, True, YELLOW)
+            self.screen.blit(wtext, (WINDOW_W // 2 - wtext.get_width() // 2, WINDOW_H // 2 + 10))
+
+        retry_text = self.font_small.render("Press R to play again, ESC for menu", True, WHITE)
+        self.screen.blit(retry_text, (WINDOW_W // 2 - retry_text.get_width() // 2, WINDOW_H // 2 + 60))
+
+
+class ThumbCurlingGame(BaseGame):
+    """Curling, played top-down across a 3-round match.
+
+    Two-hand, two-PHASE control per shot -- LEFT thumb always fires the
+    "confirm" gesture (a thumbs-up), RIGHT thumb supplies the value being
+    confirmed:
+        1. RIGHT thumb aims the stone (live direction indicator).
+        2. LEFT thumb up -> locks in that direction, moves to power.
+        3. RIGHT thumb sets power (live power meter).
+        4. LEFT thumb up -> locks in power AND releases the stone.
+    The stone slides in a straight line at the chosen angle/speed and
+    gradually decelerates on the ice, coming to rest somewhere on the
+    sheet -- score is based on which ring of the house it lands in.
+
+    Modes: 1 Player, 2 Player (alternate throws on the same round before
+    advancing), or vs AI (a deliberately imprecise opponent). Each
+    difficulty has its own set of 3 house placements -- Hard's house sits
+    further off-center and adds a guard stone to navigate around."""
+
+    name = "Thumb Curling"
+    SUPPORTS_DIFFICULTY = False  # handled internally, same reasoning as Thumb Golf
+    SUPPORTS_TWO_PLAYER = False
+
+    SHEET_LEFT = 220
+    SHEET_RIGHT = WINDOW_W - 220
+    SHEET_TOP = 90
+    SHEET_BOTTOM = WINDOW_H - 40
+    SHEET_CENTER_X = (SHEET_LEFT + SHEET_RIGHT) / 2
+
+    STONE_START_X = SHEET_CENTER_X
+    STONE_START_Y = SHEET_BOTTOM - 30
+    HOUSE_Y = SHEET_TOP + 70
+
+    STONE_RADIUS = 12
+    GUARD_RADIUS = 14
+
+    MAX_ANGLE = math.radians(22)
+    FRICTION = 250.0     # px/sec^2 -- ice deceleration
+    MIN_SPEED = 60.0
+    MAX_SPEED = 460.0
+    STOP_SPEED = 2.0
+
+    SHOOT_THRESHOLD = 0.75   # LEFT thumb value above this counts as a "confirm" gesture
+
+    RING_RADII_POINTS = [(18, 5), (36, 3), (54, 2), (72, 1)]  # base radii (scaled by house_scale), outer to inner order not required
+
+    ROUNDS_PER_MATCH = 3
+    TURN_TRANSITION_TIME = 1.8
+
+    AI_THINK_TIME = 1.0
+    AI_DIRECTION_NOISE = 0.16   # fraction of the 0-1 control range -- this IS the bad AI
+    AI_POWER_NOISE = 0.20
+
+    # 3 house positions per difficulty (one per round) -- horizontal offset
+    # in px from the sheet's center line. Harder difficulties push the
+    # house further off-center, shrink the scoring rings, and (Hard only)
+    # add a guard stone to navigate around.
+    DIFFICULTY_SETTINGS = {
+        "Easy":   {"house_offsets": [0, 24, -24], "house_scale": 1.15, "guard": False},
+        "Medium": {"house_offsets": [54, -45, 66], "house_scale": 1.0, "guard": False},
+        "Hard":   {"house_offsets": [84, -75, 60], "house_scale": 0.85, "guard": True},
+    }
+
+    def __init__(self, screen, controller, difficulty=None, mode="AI"):
+        super().__init__(screen, controller, difficulty, mode)
+
+        self.font_big = load_app_font("bold", 40)
+        self.font_med = load_app_font("bold", 26)
+        self.font_small = load_app_font("regular", 18)
+        self.font_tiny = load_app_font("regular", 15)
+        self._thumbsup_icon = render_icon("\U0001F44D", "UP", 22, self.font_tiny, WHITE)
+
+        self._build_sheet_texture()
+
+        self.match_mode = "1P"
+        self.difficulty = "Medium"
+        self.phase = "MODE_SELECT"
+        self._build_mode_buttons()
+
+    # ---------------------------------------------------------------
+    # sheet art
+    # ---------------------------------------------------------------
+
+    def _build_sheet_texture(self):
+        w = int(self.SHEET_RIGHT - self.SHEET_LEFT)
+        h = int(self.SHEET_BOTTOM - self.SHEET_TOP)
+        ice_top, ice_bottom = (150, 205, 230), (100, 170, 200)
+
+        surf = pygame.Surface((w, h))
+        for y in range(h):
+            t = y / max(1, h - 1)
+            color = tuple(int(ice_top[i] + (ice_bottom[i] - ice_top[i]) * t) for i in range(3))
+            pygame.draw.line(surf, color, (0, y), (w, y))
+
+        shine = pygame.Surface((w, h), pygame.SRCALPHA)
+        for x in range(-h, w, 90):
+            pygame.draw.line(shine, (255, 255, 255, 20), (x, 0), (x + h, h), 30)
+        surf.blit(shine, (0, 0))
+
+        # tee line + back line, purely decorative
+        tee_y = int(self.HOUSE_Y - self.SHEET_TOP)
+        pygame.draw.line(surf, (230, 240, 248), (0, tee_y), (w, tee_y), 2)
+
+        self._sheet_surface = surf
+
+    # ---------------------------------------------------------------
+    # mode / difficulty select (self-contained, same pattern as Thumb Golf)
+    # ---------------------------------------------------------------
+
+    def _build_mode_buttons(self):
+        btn_w, btn_h, gap = 320, 64, 20
+        total_h = 3 * btn_h + 2 * gap
+        start_y = WINDOW_H // 2 - total_h // 2 + 20
+        specs = [
+            ("1P", "1 Player", "\U0001F464", "1"),
+            ("2P", "2 Player", "\U0001F465", "2"),
+            ("AI", "vs AI", "\U0001F916", "A"),
+        ]
+        self.mode_buttons = []
+        for i, (mode_id, label, icon, fallback) in enumerate(specs):
+            rect = pygame.Rect(WINDOW_W // 2 - btn_w // 2, start_y + i * (btn_h + gap), btn_w, btn_h)
+            btn = Button(rect, label, self.font_med, icon_emoji=icon, icon_fallback=fallback,
+                         base_color=GREEN, text_color=BLACK)
+            self.mode_buttons.append((btn, mode_id))
+
+    def _build_difficulty_buttons(self):
+        btn_w, btn_h, gap = 320, 64, 20
+        total_h = 3 * btn_h + 2 * gap
+        start_y = WINDOW_H // 2 - total_h // 2 + 20
+        specs = [("Easy", GREEN), ("Medium", YELLOW), ("Hard", RED)]
+        self.difficulty_buttons = []
+        for i, (label, color) in enumerate(specs):
+            rect = pygame.Rect(WINDOW_W // 2 - btn_w // 2, start_y + i * (btn_h + gap), btn_w, btn_h)
+            btn = Button(rect, label, self.font_med, base_color=color, text_color=BLACK)
+            self.difficulty_buttons.append((btn, label))
+        self.back_button = Button(pygame.Rect(30, 30, 110, 46), "Back", self.font_small,
+                                   icon_fallback="←", base_color=DARK_GRAY, text_color=WHITE)
+
+    def _draw_mode_select(self):
+        self.screen.blit(BACKGROUND, (0, 0))
+        title = self.font_big.render("Thumb Curling", True, WHITE)
+        self.screen.blit(title, (WINDOW_W // 2 - title.get_width() // 2, 90))
+        subtitle = self.font_small.render("Choose how you want to play", True, GRAY)
+        self.screen.blit(subtitle, (WINDOW_W // 2 - subtitle.get_width() // 2, 150))
+        for btn, _ in self.mode_buttons:
+            btn.draw(self.screen)
+
+    def _draw_difficulty_select(self):
+        self.screen.blit(BACKGROUND, (0, 0))
+        title = self.font_big.render("Choose Difficulty", True, WHITE)
+        self.screen.blit(title, (WINDOW_W // 2 - title.get_width() // 2, 90))
+        subtitle = self.font_small.render(
+            "3 rounds each -- harder difficulties push the house off-center", True, GRAY)
+        self.screen.blit(subtitle, (WINDOW_W // 2 - subtitle.get_width() // 2, 150))
+        for btn, _ in self.difficulty_buttons:
+            btn.draw(self.screen)
+        self.back_button.draw(self.screen)
+
+    # ---------------------------------------------------------------
+    # match / turn / round setup
+    # ---------------------------------------------------------------
+
+    def start_match(self):
+        if self.match_mode == "1P":
+            self.players = ["YOU"]
+        elif self.match_mode == "2P":
+            self.players = ["P1", "P2"]
+        else:
+            self.players = ["YOU", "AI"]
+        self.scores = {p: [] for p in self.players}
+        self.round_idx = 0
+        self._setup_round()
+        self.phase = "PLAYING"
+
+    def _setup_round(self):
+        settings = self.DIFFICULTY_SETTINGS[self.difficulty]
+        offset = settings["house_offsets"][self.round_idx]
+        self.house_x = self.SHEET_CENTER_X + offset
+        self.house_scale = settings["house_scale"]
+        self.guard_active = settings["guard"]
+        self.guard_x = self.SHEET_CENTER_X
+        self.guard_y = self.STONE_START_Y - 0.65 * (self.STONE_START_Y - self.HOUSE_Y)
+        self.turn_idx = 0
+        self._start_player_turn()
+
+    def _start_player_turn(self):
+        self.ball_x = float(self.STONE_START_X)
+        self.ball_y = float(self.STONE_START_Y)
+        self.ball_vx = 0.0
+        self.ball_vy = 0.0
+        self.ball_state = "ready"
+        self.shot_phase = "AIMING"
+        self.direction_live = 0.5
+        self.power_live = 0.0
+        self.chosen_direction = None
+        self.chosen_power = None
+        self.removed_from_play = False
+        self._prev_left_value = None
+        self.ai_timer = None
+
+    def _current_player(self):
+        return self.players[self.turn_idx]
+
+    def _current_player_is_ai(self):
+        return self._current_player() == "AI"
+
+    def handle_event(self, event):
+        if self.phase == "MODE_SELECT":
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                for btn, mode_id in self.mode_buttons:
+                    if btn.is_clicked(event.pos):
+                        self.match_mode = mode_id
+                        self._build_difficulty_buttons()
+                        self.phase = "DIFFICULTY_SELECT"
+                        return
+        elif self.phase == "DIFFICULTY_SELECT":
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                for btn, label in self.difficulty_buttons:
+                    if btn.is_clicked(event.pos):
+                        self.difficulty = label
+                        self.start_match()
+                        return
+                if self.back_button.is_clicked(event.pos):
+                    self._build_mode_buttons()
+                    self.phase = "MODE_SELECT"
+                    return
+        else:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                self._build_mode_buttons()
+                self.phase = "MODE_SELECT"
+
+    # ---------------------------------------------------------------
+    # update
+    # ---------------------------------------------------------------
+
+    def update(self, dt):
+        if self.phase in ("MODE_SELECT", "DIFFICULTY_SELECT"):
+            mouse_pos = pygame.mouse.get_pos()
+            mouse_down = pygame.mouse.get_pressed()[0]
+            buttons = self.mode_buttons if self.phase == "MODE_SELECT" else self.difficulty_buttons
+            for btn, _ in buttons:
+                btn.update(dt, mouse_pos, mouse_down)
+            if self.phase == "DIFFICULTY_SELECT":
+                self.back_button.update(dt, mouse_pos, mouse_down)
+        elif self.phase == "PLAYING":
+            self._update_playing(dt)
+        elif self.phase == "TURN_COMPLETE":
+            self.turn_transition_timer -= dt
+            if self.turn_transition_timer <= 0:
+                self._advance_after_turn()
+        # MATCH_COMPLETE: nothing to update, just waiting for R
+
+    def _update_playing(self, dt):
+        if self.ball_state == "ready":
+            if self._current_player_is_ai():
+                if self.ai_timer is None:
+                    self.ai_timer = self.AI_THINK_TIME
+                else:
+                    self.ai_timer -= dt
+                    if self.ai_timer <= 0:
+                        self._take_ai_shot()
+            else:
+                self._update_human_shot(dt)
+        elif self.ball_state == "sliding":
+            self._update_slide(dt)
+            if self.ball_state == "stopped":
+                self._end_turn()
+
+    def _update_human_shot(self, dt):
+        right_value = max(0.0, min(1.0, self.controller.get_right_value()))
+        left_value = max(0.0, min(1.0, self.controller.get_left_value()))
+
+        if self._prev_left_value is None:
+            self._prev_left_value = left_value
+            rising_edge = False
+        else:
+            rising_edge = self._prev_left_value <= self.SHOOT_THRESHOLD < left_value
+            self._prev_left_value = left_value
+
+        if self.shot_phase == "AIMING":
+            self.direction_live = right_value
+            if rising_edge:
+                self.chosen_direction = right_value
+                self.shot_phase = "POWER"
+        elif self.shot_phase == "POWER":
+            self.power_live = right_value
+            if rising_edge:
+                self.chosen_power = right_value
+                self._launch_stone(self.chosen_direction, self.chosen_power)
+
+    def _estimate_good_shot(self):
+        dx = self.house_x - self.STONE_START_X
+        dy = self.HOUSE_Y - self.STONE_START_Y  # negative -- house is up-sheet from the start
+        target_distance = math.hypot(dx, dy)
+        target_angle = math.atan2(dx, -dy)
+        direction_value = 0.5 + (target_angle / self.MAX_ANGLE) * 0.5
+        required_speed = math.sqrt(max(0.0, 2 * self.FRICTION * target_distance))
+        power_value = (required_speed - self.MIN_SPEED) / (self.MAX_SPEED - self.MIN_SPEED)
+        return max(0.0, min(1.0, direction_value)), max(0.0, min(1.0, power_value))
+
+    def _take_ai_shot(self):
+        target_direction, target_power = self._estimate_good_shot()
+        noisy_direction = max(0.0, min(1.0, target_direction + random.uniform(-self.AI_DIRECTION_NOISE, self.AI_DIRECTION_NOISE)))
+        noisy_power = max(0.0, min(1.0, target_power + random.uniform(-self.AI_POWER_NOISE, self.AI_POWER_NOISE)))
+        self.chosen_direction = noisy_direction
+        self.chosen_power = noisy_power
+        self._launch_stone(noisy_direction, noisy_power)
+        self.ai_timer = None
+
+    def _launch_stone(self, direction_value, power_value):
+        angle = (direction_value - 0.5) * 2 * self.MAX_ANGLE
+        speed = self.MIN_SPEED + power_value * (self.MAX_SPEED - self.MIN_SPEED)
+        self.ball_vx = speed * math.sin(angle)
+        self.ball_vy = -speed * math.cos(angle)
+        self.ball_state = "sliding"
+        self.removed_from_play = False
+
+    def _update_slide(self, dt):
+        speed = math.hypot(self.ball_vx, self.ball_vy)
+        if speed <= 0:
+            self.ball_state = "stopped"
+            return
+
+        new_speed = max(0.0, speed - self.FRICTION * dt)
+        scale = new_speed / speed
+        self.ball_vx *= scale
+        self.ball_vy *= scale
+        self.ball_x += self.ball_vx * dt
+        self.ball_y += self.ball_vy * dt
+
+        if self.guard_active:
+            dist_to_guard = math.hypot(self.ball_x - self.guard_x, self.ball_y - self.guard_y)
+            if dist_to_guard < self.STONE_RADIUS + self.GUARD_RADIUS:
+                self.ball_state = "stopped"
+                return
+
+        if (self.ball_x < self.SHEET_LEFT or self.ball_x > self.SHEET_RIGHT
+                or self.ball_y < self.SHEET_TOP - 20):
+            self.ball_state = "stopped"
+            self.removed_from_play = True
+            return
+
+        if new_speed < self.STOP_SPEED:
+            self.ball_vx = self.ball_vy = 0.0
+            self.ball_state = "stopped"
+
+    def _points_for_distance(self, dist):
+        for radius, points in self.RING_RADII_POINTS:
+            if dist <= radius * self.house_scale:
+                return points
+        return 0
+
+    def _end_turn(self):
+        if self.removed_from_play:
+            points = 0
+        else:
+            dist = math.hypot(self.ball_x - self.house_x, self.ball_y - self.HOUSE_Y)
+            points = self._points_for_distance(dist)
+
+        player = self._current_player()
+        self.scores[player].append(points)
+        self.turn_result_player = player
+        self.turn_result_points = points
+        self.turn_result_removed = self.removed_from_play
+        self.phase = "TURN_COMPLETE"
+        self.turn_transition_timer = self.TURN_TRANSITION_TIME
+
+    def _advance_after_turn(self):
+        self.turn_idx += 1
+        if self.turn_idx >= len(self.players):
+            self.turn_idx = 0
+            self.round_idx += 1
+            if self.round_idx >= self.ROUNDS_PER_MATCH:
+                self.phase = "MATCH_COMPLETE"
+                return
+            self._setup_round()
+        else:
+            self._start_player_turn()
+        self.phase = "PLAYING"
+
+    # ---------------------------------------------------------------
+    # draw
+    # ---------------------------------------------------------------
+
+    def draw(self):
+        if self.phase == "MODE_SELECT":
+            self._draw_mode_select()
+        elif self.phase == "DIFFICULTY_SELECT":
+            self._draw_difficulty_select()
+        elif self.phase in ("PLAYING", "TURN_COMPLETE"):
+            self._draw_playing()
+            if self.phase == "TURN_COMPLETE":
+                self._draw_turn_complete_overlay()
+        elif self.phase == "MATCH_COMPLETE":
+            self._draw_playing()
+            self._draw_match_complete_overlay()
+
+    def _draw_playing(self):
+        self.screen.blit(BACKGROUND, (0, 0))
+        self.screen.blit(self._sheet_surface, (self.SHEET_LEFT, self.SHEET_TOP))
+
+        self._draw_house()
+        if self.guard_active:
+            pygame.draw.circle(self.screen, GRAY, (int(self.guard_x), int(self.guard_y)), self.GUARD_RADIUS)
+            pygame.draw.circle(self.screen, DARK_GRAY, (int(self.guard_x), int(self.guard_y)), self.GUARD_RADIUS, 2)
+
+        self._draw_aim_indicator()
+
+        stone_color = RED if self._current_player() in ("P2", "AI") else BLUE
+        pygame.draw.circle(self.screen, stone_color, (int(self.ball_x), int(self.ball_y)), self.STONE_RADIUS)
+        pygame.draw.circle(self.screen, DARK_GRAY, (int(self.ball_x), int(self.ball_y)), self.STONE_RADIUS, 2)
+
+        if self._current_player_is_ai():
+            self._draw_ai_turn_indicator()
+        else:
+            self._draw_control_meters()
+
+        self._draw_scoreboard()
+        self._draw_hud()
+
+    def _draw_house(self):
+        rings = [(72, RED), (54, WHITE), (36, RED), (18, BLUE)]
+        for radius, color in rings:
+            pygame.draw.circle(self.screen, color, (int(self.house_x), int(self.HOUSE_Y)),
+                                int(radius * self.house_scale))
+
+    def _draw_aim_indicator(self):
+        if self.ball_state != "ready" or self._current_player_is_ai():
+            return
+        if self.shot_phase == "AIMING":
+            direction_value, live = self.direction_live, True
+        else:
+            direction_value, live = self.chosen_direction, False
+        if direction_value is None:
+            return
+        angle = (direction_value - 0.5) * 2 * self.MAX_ANGLE
+        end_x = self.ball_x + 150 * math.sin(angle)
+        end_y = self.ball_y - 150 * math.cos(angle)
+        color = ACCENT if live else WHITE
+        pygame.draw.line(self.screen, color, (self.ball_x, self.ball_y), (end_x, end_y), 3)
+
+    def _draw_control_meters(self):
+        # direction meter (horizontal bar) -- active during AIMING
+        x, y, w, h = WINDOW_W // 2 - 110, 96, 220, 16
+        active_dir = self.shot_phase == "AIMING"
+        pygame.draw.rect(self.screen, DARK_GRAY, (x, y, w, h), border_radius=8)
+        pygame.draw.line(self.screen, GRAY, (x + w // 2, y - 4), (x + w // 2, y + h + 4), 2)
+        dir_value = self.direction_live if active_dir else (self.chosen_direction or 0.5)
+        knob_x = x + int(dir_value * w)
+        knob_color = ACCENT if active_dir else GRAY
+        pygame.draw.circle(self.screen, knob_color, (knob_x, y + h // 2), 11)
+        pygame.draw.circle(self.screen, WHITE, (knob_x, y + h // 2), 11, 2)
+        label = self.font_tiny.render("DIRECTION (RIGHT thumb)", True, GRAY)
+        self.screen.blit(label, (x + w // 2 - label.get_width() // 2, y - 20))
+
+        # power meter (vertical bar) -- active during POWER, same style as Thumb Golf's
+        px, py, pw, ph = 24, 130, 26, 200
+        pygame.draw.rect(self.screen, DARK_GRAY, (px, py, pw, ph), border_radius=8)
+        active_power = self.shot_phase == "POWER"
+        fill_h = int(ph * self.power_live) if active_power else 0
+        if fill_h > 0:
+            fill_color = GREEN if self.power_live < 0.55 else (YELLOW if self.power_live < 0.82 else RED)
+            pygame.draw.rect(self.screen, fill_color, (px, py + ph - fill_h, pw, fill_h), border_radius=8)
+        pygame.draw.rect(self.screen, GRAY if not active_power else GREEN, (px, py, pw, ph), width=2, border_radius=8)
+        plabel = self.font_tiny.render("POWER", True, GRAY)
+        self.screen.blit(plabel, (px + pw // 2 - plabel.get_width() // 2, py - 20))
+        hand_label = self.font_tiny.render("RIGHT", True, GRAY)
+        self.screen.blit(hand_label, (px + pw // 2 - hand_label.get_width() // 2, py + ph + 6))
+
+        # shoot indicator (left hand) -- shows whether the confirm gesture is currently "up"
+        sx, sy, r = 37, 372, 20
+        ready = self._prev_left_value is not None and self._prev_left_value > self.SHOOT_THRESHOLD
+        color = GREEN if ready else DARK_GRAY
+        pygame.draw.circle(self.screen, color, (sx, sy), r)
+        pygame.draw.circle(self.screen, GRAY, (sx, sy), r, 2)
+        icon = self._thumbsup_icon
+        self.screen.blit(icon, (sx - icon.get_width() // 2, sy - icon.get_height() // 2))
+        label = self.font_tiny.render("CONFIRM", True, GRAY)
+        self.screen.blit(label, (sx - label.get_width() // 2, sy + r + 6))
+        hand_label2 = self.font_tiny.render("LEFT", True, GRAY)
+        self.screen.blit(hand_label2, (sx - hand_label2.get_width() // 2, sy + r + 24))
+
+    def _draw_ai_turn_indicator(self):
+        label = self.font_small.render(f"{self._current_player()} is lining up...", True, GRAY)
+        self.screen.blit(label, (24, 112))
+        if self.ai_timer is not None:
+            frac = max(0.0, min(1.0, self.ai_timer / self.AI_THINK_TIME))
+            bar_w = 160
+            pygame.draw.rect(self.screen, DARK_GRAY, (24, 144, bar_w, 10), border_radius=5)
+            pygame.draw.rect(self.screen, YELLOW, (24, 144, int(bar_w * (1 - frac)), 10), border_radius=5)
+
+    def _draw_scoreboard(self):
+        round_text = self.font_small.render(f"ROUND {self.round_idx + 1} / {self.ROUNDS_PER_MATCH}", True, GRAY)
+        self.screen.blit(round_text, (WINDOW_W // 2 - round_text.get_width() // 2, 8))
+
+        def total_for(p):
+            return sum(self.scores[p])
+
+        if len(self.players) == 1:
+            p = self.players[0]
+            score_text = self.font_big.render(f"Score: {total_for(p)}", True, WHITE)
+            self.screen.blit(score_text, (WINDOW_W // 2 - score_text.get_width() // 2, 30))
+        else:
+            p1, p2 = self.players
+            color1 = WHITE if self._current_player() == p1 else GRAY
+            color2 = WHITE if self._current_player() == p2 else GRAY
+            p1_text = self.font_med.render(f"{p1}: {total_for(p1)}", True, color1)
+            p2_text = self.font_med.render(f"{p2}: {total_for(p2)}", True, color2)
+            gap = 40
+            total_w = p1_text.get_width() + p2_text.get_width() + gap
+            start_x = WINDOW_W // 2 - total_w // 2
+            self.screen.blit(p1_text, (start_x, 30))
+            self.screen.blit(p2_text, (start_x + p1_text.get_width() + gap, 30))
+
+    def _draw_hud(self):
+        info_text = self.font_small.render(f"{self.difficulty} difficulty", True, GRAY)
+        self.screen.blit(info_text, (WINDOW_W - info_text.get_width() - 20, 20))
+
+        warn_y = WINDOW_H // 2 - 40
+        if not self._current_player_is_ai():
+            if not self.controller.get_right_detected():
+                warn = self.font_small.render("RIGHT hand not detected -- needed to aim/power", True, RED)
+                self.screen.blit(warn, (WINDOW_W // 2 - warn.get_width() // 2, warn_y))
+                warn_y += 26
+            if not self.controller.get_left_detected():
+                warn = self.font_small.render("LEFT hand not detected -- needed to confirm", True, RED)
+                self.screen.blit(warn, (WINDOW_W // 2 - warn.get_width() // 2, warn_y))
+
+        if self._current_player_is_ai():
+            hint_str = f"{self._current_player()} is taking their shot... | R = restart match | ESC = menu"
+        elif self.shot_phase == "AIMING":
+            hint_str = f"{self._current_player()}'s turn  -  RIGHT thumb = aim | LEFT thumb UP = confirm direction"
+        else:
+            hint_str = f"{self._current_player()}'s turn  -  RIGHT thumb = power | LEFT thumb UP = shoot"
+        hint = self.font_small.render(hint_str, True, GRAY)
+        self.screen.blit(hint, (WINDOW_W // 2 - hint.get_width() // 2, WINDOW_H - 20))
+
+    def _draw_turn_complete_overlay(self):
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        self.screen.blit(overlay, (0, 0))
+
+        if self.turn_result_removed:
+            text, color = f"{self.turn_result_player}'s stone went out of play!", RED
+        elif self.turn_result_points > 0:
+            text, color = f"{self.turn_result_player} scores {self.turn_result_points} point(s)!", GREEN
+        else:
+            text, color = f"{self.turn_result_player}'s stone missed the house", YELLOW
+        msg = self.font_big.render(text, True, color)
+        self.screen.blit(msg, (WINDOW_W // 2 - msg.get_width() // 2, WINDOW_H // 2 - 20))
+
+    def _draw_match_complete_overlay(self):
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        self.screen.blit(overlay, (0, 0))
+
+        title = self.font_big.render("MATCH COMPLETE!", True, GREEN)
+        self.screen.blit(title, (WINDOW_W // 2 - title.get_width() // 2, WINDOW_H // 2 - 100))
+
+        totals = {p: sum(self.scores[p]) for p in self.players}
+        if len(self.players) == 1:
+            p = self.players[0]
+            line = self.font_med.render(f"Total score: {totals[p]}", True, WHITE)
+            self.screen.blit(line, (WINDOW_W // 2 - line.get_width() // 2, WINDOW_H // 2 - 30))
+        else:
+            p1, p2 = self.players
+            line = self.font_med.render(f"{p1}: {totals[p1]}   {p2}: {totals[p2]}", True, WHITE)
+            self.screen.blit(line, (WINDOW_W // 2 - line.get_width() // 2, WINDOW_H // 2 - 30))
+            if totals[p1] > totals[p2]:
+                winner = f"{p1} wins!"
+            elif totals[p2] > totals[p1]:
+                winner = f"{p2} wins!"
+            else:
+                winner = "It's a tie!"
+            wtext = self.font_med.render(winner, True, YELLOW)
+            self.screen.blit(wtext, (WINDOW_W // 2 - wtext.get_width() // 2, WINDOW_H // 2 + 10))
+
+        retry_text = self.font_small.render("Press R to play again, ESC for menu", True, WHITE)
+        self.screen.blit(retry_text, (WINDOW_W // 2 - retry_text.get_width() // 2, WINDOW_H // 2 + 60))
+
+
+# ============================================================
 # GAME REGISTRY -- add new games here
 # ============================================================
 
 GAMES = {
+    "Air Hockey": {"class": AirHockeyGame, "icon": "🏒", "fallback_icon": "o"},
     "Balance Beam": {"class": BalanceBeamGame, "icon": "⚖", "fallback_icon": "="},
     "Breakout": {"class": BreakoutGame, "icon": "🧱", "fallback_icon": "▪"},
+    "Thumb Golf": {"class": ThumbGolfGame, "icon": "⛳", "fallback_icon": "P"},
+    "Thumb Curling": {"class": ThumbCurlingGame, "icon": "🥌", "fallback_icon": "C"},
     "Pong": {"class": PongGame, "icon": "\U0001F3AE", "fallback_icon": "\u25B6"},  # 🎮 / ▶
     # "NextGame": {"class": NextGameClass, "icon": "\U0001F3B2", "fallback_icon": "\u2666"},
 }
@@ -963,11 +2475,27 @@ class Menu:
         self.font_button = load_app_font("bold", 30)
         self.font_small = load_app_font("regular", 20)
 
+        # Lay buttons out in the space between the title panel and the
+        # bottom status hints, shrinking button height/gap if there are
+        # enough games that they wouldn't otherwise fit -- fixes buttons
+        # running off the bottom of the window as more games get added.
+        top_limit = 225
+        bottom_limit = WINDOW_H - 55
+        available_h = bottom_limit - top_limit
+
+        n = len(GAMES)
+        button_h, gap = 68, 18
+        total_h = n * button_h + (n - 1) * gap
+        if total_h > available_h and n > 0:
+            scale = available_h / total_h
+            button_h = max(46, int(button_h * scale))
+            gap = max(8, int(gap * scale))
+            total_h = n * button_h + (n - 1) * gap
+        start_y = top_limit + max(0, (available_h - total_h) // 2)
+
         self.buttons = []
-        start_y = 250
-        spacing = 95
         for i, (name, info) in enumerate(GAMES.items()):
-            rect = pygame.Rect(WINDOW_W // 2 - 170, start_y + i * spacing, 340, 68)
+            rect = pygame.Rect(WINDOW_W // 2 - 170, start_y + i * (button_h + gap), 340, button_h)
             btn = Button(
                 rect, name, self.font_button,
                 icon_emoji=info.get("icon"), icon_fallback=info.get("fallback_icon"),
